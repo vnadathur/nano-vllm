@@ -3,7 +3,6 @@ import os
 import pickle
 import time
 import torch
-import torch._inductor.config
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
@@ -70,8 +69,9 @@ class ModelRunner:
         if not self.enforce_eager:
             t0 = time.perf_counter()
             # Inductor's default XBLOCK limit (4096) is too conservative for
-            # large models on H100. Allow 8192 to avoid compilation failures.
-            torch._inductor.config.triton.max_block['X'] = 8192
+            # large models on H100. Disable the check to allow larger blocks.
+            from torch._inductor.runtime import triton_heuristics
+            triton_heuristics.check_max_block = lambda cfg: None
             self.model = torch.compile(self.model, mode="reduce-overhead")
             # Trigger compilation under inference_mode to match run_model's
             # context — Dynamo guards on grad mode, so a mismatch would
