@@ -1,4 +1,7 @@
+import hashlib
+import os
 import pickle
+import time
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -8,8 +11,28 @@ from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
-from nanovllm.utils.context import set_context, get_context, reset_context
+from nanovllm.utils.context import set_context, reset_context
 from nanovllm.utils.loader import load_model
+
+
+def _setup_compile_cache(config: Config):
+    """Configure TorchInductor disk cache keyed by model + environment."""
+    factors = "|".join([
+        config.model,
+        str(config.hf_config.torch_dtype),
+        str(config.tensor_parallel_size),
+        str(config.max_model_len),
+        torch.__version__,
+    ])
+    config_hash = hashlib.sha256(factors.encode()).hexdigest()[:16]
+    cache_dir = os.path.join(
+        os.path.expanduser("~"), ".cache", "nanovllm", "torch_compile", config_hash,
+    )
+    os.makedirs(cache_dir, exist_ok=True)
+    os.environ["TORCHINDUCTOR_FX_GRAPH_CACHE"] = "1"
+    os.environ["TORCHINDUCTOR_AUTOGRAD_CACHE"] = "1"
+    os.environ["TORCHINDUCTOR_CACHE_DIR"] = cache_dir
+    return cache_dir
 
 
 class ModelRunner:
@@ -23,6 +46,10 @@ class ModelRunner:
         self.rank = rank
         self.event = event
 
+        if not self.enforce_eager:
+            cache_dir = _setup_compile_cache(config)
+            print(f"[nanovllm] Compile cache: {cache_dir}")
+
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
@@ -33,8 +60,27 @@ class ModelRunner:
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
+
+        # Full-model torch.compile with reduce-overhead: attention is wrapped
+        # as a custom op (nanovllm::attention) so Dynamo traces the entire
+        # forward as one graph. Inductor fuses kernels across layers.
+        # reduce-overhead automatically captures piecewise CUDA graphs —
+        # regions between attention ops are graphed, attention runs eagerly.
         if not self.enforce_eager:
-            self.capture_cudagraph()
+            t0 = time.perf_counter()
+            self.model = torch.compile(self.model, mode="reduce-overhead")
+            # Trigger compilation under inference_mode to match run_model's
+            # context — Dynamo guards on grad mode, so a mismatch would
+            # discard this compilation on the first real call.
+            with torch.inference_mode():
+                dummy_ids = torch.zeros(1, dtype=torch.int64)
+                dummy_pos = torch.zeros(1, dtype=torch.int64)
+                set_context(False, slot_mapping=torch.zeros(1, dtype=torch.int32),
+                            context_lens=torch.ones(1, dtype=torch.int32),
+                            block_tables=torch.zeros(1, 1, dtype=torch.int32))
+                self.model(dummy_ids, dummy_pos)
+                reset_context()
+            print(f"[nanovllm] torch.compile: {time.perf_counter() - t0:.1f}s")
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -53,8 +99,6 @@ class ModelRunner:
             dist.barrier()
             if self.rank == 0:
                 self.shm.unlink()
-        if not self.enforce_eager:
-            del self.graphs, self.graph_pool
         torch.cuda.synchronize()
         dist.destroy_process_group()
 
@@ -107,8 +151,12 @@ class ModelRunner:
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
+        # Available = (total * utilization) - (peak overhead beyond current).
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert config.num_kvcache_blocks > 0
+        assert config.num_kvcache_blocks > 0, (
+            f"Not enough GPU memory for KV cache. "
+            f"Free: {free / 2**30:.1f}GB, need at least 1 block ({block_bytes / 2**20:.0f}MB)"
+        )
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0
         for module in self.model.modules():
@@ -187,65 +235,16 @@ class ModelRunner:
         return temperatures
 
     @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
-        if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
-            return self.model.compute_logits(self.model(input_ids, positions))
-        else:
-            bs = input_ids.size(0)
-            context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
-            graph_vars = self.graph_vars
-            graph_vars["input_ids"][:bs] = input_ids
-            graph_vars["positions"][:bs] = positions
-            graph_vars["slot_mapping"].fill_(-1)
-            graph_vars["slot_mapping"][:bs] = context.slot_mapping
-            graph_vars["context_lens"].zero_()
-            graph_vars["context_lens"][:bs] = context.context_lens
-            graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
-            graph.replay()
-            return self.model.compute_logits(graph_vars["outputs"][:bs])
+    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor):
+        # reduce-overhead handles CUDA graph capture/replay automatically.
+        # Compiled regions between attention ops are graphed; attention runs eagerly.
+        return self.model.compute_logits(self.model(input_ids, positions))
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
-        logits = self.run_model(input_ids, positions, is_prefill)
+        logits = self.run_model(input_ids, positions)
         token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
         reset_context()
         return token_ids
 
-    @torch.inference_mode()
-    def capture_cudagraph(self):
-        config = self.config
-        hf_config = config.hf_config
-        max_bs = min(self.config.max_num_seqs, 512)
-        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
-        input_ids = torch.zeros(max_bs, dtype=torch.int64)
-        positions = torch.zeros(max_bs, dtype=torch.int64)
-        slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
-        context_lens = torch.zeros(max_bs, dtype=torch.int32)
-        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
-        outputs = torch.zeros(max_bs, hf_config.hidden_size)
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
-        self.graphs = {}
-        self.graph_pool = None
-
-        for bs in reversed(self.graph_bs):
-            graph = torch.cuda.CUDAGraph()
-            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
-            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
-            with torch.cuda.graph(graph, self.graph_pool):
-                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
-            if self.graph_pool is None:
-                self.graph_pool = graph.pool()
-            self.graphs[bs] = graph
-            torch.cuda.synchronize()
-            reset_context()
-
-        self.graph_vars = dict(
-            input_ids=input_ids,
-            positions=positions,
-            slot_mapping=slot_mapping,
-            context_lens=context_lens,
-            block_tables=block_tables,
-            outputs=outputs,
-        )

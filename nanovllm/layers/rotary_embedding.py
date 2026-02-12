@@ -24,7 +24,6 @@ class RotaryEmbedding(nn.Module):
         base: float,
     ) -> None:
         super().__init__()
-        self.head_size = head_size
         assert rotary_dim == head_size
         inv_freq = 1.0 / (base**(torch.arange(0, rotary_dim, 2, dtype=torch.float) / rotary_dim))
         t = torch.arange(max_position_embeddings, dtype=torch.float)
@@ -34,7 +33,6 @@ class RotaryEmbedding(nn.Module):
         cache = torch.cat((cos, sin), dim=-1).unsqueeze_(1)
         self.register_buffer("cos_sin_cache", cache, persistent=False)
 
-    @torch.compile
     def forward(
         self,
         positions: torch.Tensor,

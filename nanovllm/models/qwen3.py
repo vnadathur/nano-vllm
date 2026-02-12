@@ -64,6 +64,8 @@ class Qwen3Attention(nn.Module):
             self.scaling,
             self.num_kv_heads,
         )
+        # Qwen3 uses EITHER QKV bias OR QK layernorm, never both.
+        # Qwen3-14B-Base has attention_bias=False, so QK norms are active.
         if not self.qkv_bias:
             self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
             self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -149,6 +151,7 @@ class Qwen3DecoderLayer(nn.Module):
         residual: torch.Tensor | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
+            # First layer: save original as residual, normalize for attention.
             hidden_states, residual = self.input_layernorm(hidden_states), hidden_states
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
