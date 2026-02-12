@@ -70,8 +70,11 @@ class ModelRunner:
             t0 = time.perf_counter()
             # Inductor's default XBLOCK limit (4096) is too conservative for
             # large models on H100. Disable the check to allow larger blocks.
+            # compile_threads=1 forces single-process compilation so the
+            # patch applies (subprocesses would reimport the original).
             from torch._inductor.runtime import triton_heuristics
             triton_heuristics.check_max_block = lambda cfg: None
+            os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
             self.model = torch.compile(self.model, mode="reduce-overhead")
             # Trigger compilation under inference_mode to match run_model's
             # context — Dynamo guards on grad mode, so a mismatch would
