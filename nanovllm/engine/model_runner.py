@@ -61,21 +61,13 @@ class ModelRunner:
         self.warmup_model()
         self.allocate_kv_cache()
 
-        # Full-model torch.compile with reduce-overhead: attention is wrapped
-        # as a custom op (nanovllm::attention) so Dynamo traces the entire
-        # forward as one graph. Inductor fuses kernels across layers.
-        # reduce-overhead automatically captures piecewise CUDA graphs —
-        # regions between attention ops are graphed, attention runs eagerly.
+        # Full-model torch.compile: attention is wrapped as a custom op
+        # (nanovllm::attention) so Dynamo traces the entire forward as one
+        # graph. Inductor fuses kernels across layers (RMSNorm, RoPE,
+        # SiLU+Mul, residual adds — all merged into fewer, larger kernels).
         if not self.enforce_eager:
             t0 = time.perf_counter()
-            # Inductor's default XBLOCK limit (4096) is too conservative for
-            # large models on H100. Disable the check to allow larger blocks.
-            # compile_threads=1 forces single-process compilation so the
-            # patch applies (subprocesses would reimport the original).
-            from torch._inductor.runtime import triton_heuristics
-            triton_heuristics.check_max_block = lambda cfg: None
-            os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = "1"
-            self.model = torch.compile(self.model, mode="reduce-overhead")
+            self.model = torch.compile(self.model)
             # Trigger compilation under inference_mode to match run_model's
             # context — Dynamo guards on grad mode, so a mismatch would
             # discard this compilation on the first real call.
