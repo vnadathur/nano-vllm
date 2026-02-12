@@ -68,6 +68,10 @@ class ModelRunner:
         # regions between attention ops are graphed, attention runs eagerly.
         if not self.enforce_eager:
             t0 = time.perf_counter()
+            # Inductor's default XBLOCK limit (4096) is too conservative for
+            # large models on H100. Allow 8192 to avoid compilation failures.
+            import torch._inductor.config
+            torch._inductor.config.triton.max_block['X'] = 8192
             self.model = torch.compile(self.model, mode="reduce-overhead")
             # Trigger compilation under inference_mode to match run_model's
             # context — Dynamo guards on grad mode, so a mismatch would
