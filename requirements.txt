@@ -1,0 +1,16 @@
+# Reproducible install for H100 / CUDA 12.8.
+# Usage:
+#   uv pip install torch==2.9.1 --index-url https://download.pytorch.org/whl/cu128
+#   uv pip install -r requirements.txt --no-build-isolation
+#
+# flash-attn must be installed AFTER torch. Get a prebuilt wheel from
+# https://flashattn.dev (select your Python + torch + CUDA versions).
+
+torch>=2.8.0
+triton>=3.0.0
+transformers>=4.51.0
+flash-attn>=2.7.0
+xxhash
+tqdm
+huggingface_hub
+safetensors
